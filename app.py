@@ -1,99 +1,96 @@
 import streamlit as st
 import pandas as pd
 import requests
-import time
-from streamlit_autorefresh import st_autorefresh
+import pandas_ta as ta
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+from alpaca_trade_api.rest import REST, TimeFrame
 
-# Konfiguration til både Mobil & PC
-st.set_page_config(page_title="Squeeze Terminal", page_icon="⚡", layout="centered")
-st_autorefresh(interval=30 * 1000, key="datarefresh")
+# --- 1. SETUP & SIKKERHED ---
+st.set_page_config(layout="wide", page_title="QUANT-X PRO TERMINAL")
 
-# Skjul menuer for rent look
-st.markdown("<style>#MainMenu {visibility: hidden;} footer {visibility: hidden;} header {visibility: hidden;}</style>", unsafe_allow_html=True)
+ALPACA_KEY = st.secrets["ALPACA_KEY"]
+ALPACA_SECRET = st.secrets["ALPACA_SECRET"]
+FMP_API_KEY = st.secrets["FMP_API_KEY"]
 
-def play_sound():
-    sound_url = "https://www.soundjay.com/buttons/sounds/button-3.mp3"
-    st.markdown(f'<audio autoplay><source src="{sound_url}" type="audio/mp3"></audio>', unsafe_allow_html=True)
+alpaca = REST(ALPACA_KEY, ALPACA_SECRET, base_url='https://paper-api.alpaca.markets')
 
-st.title("⚡ Live Squeeze List")
-st.caption(f"Scanner: RVOL > 5x, Over VWAP & News Score | {time.strftime('%H:%M:%S')}")
-
-API_KEY = "DKC7vblNaiBbTzht7ASgqgnmlvzl5ym"
-
-def calculate_smart_score(rvol, sf, dtc, news_text, chg):
-    score = 30
-    power_words = ['fda', 'phase 3', 'phase 2', 'clinical', 'breakthrough', 'approval', 'earnings', 'beat', 'guidance', 'profitable', 'contract', 'partnership', 'merger', 'acquisition', 'ai', 'crypto']
-    danger_words = ['offering', 'dilution', 'lawsuit', 'delisting', 'default']
+# --- 2. DATA FUNKTIONER ---
+def get_charts(symbol):
+    # Henter 1-minut (inkl. Pre-market) og Daily bars
+    min_bars = alpaca.get_bars(symbol, TimeFrame.Minute, limit=200, extended_hours=True).df
+    day_bars = alpaca.get_bars(symbol, TimeFrame.Day, limit=100).df
     
-    news_clean = news_text.lower()
-    for word in power_words:
-        if word in news_clean: score += 5
-    for word in danger_words:
-        if word in news_clean: score -= 40
-        
-    score += min(20, (rvol / 1.5))
-    if sf > 15: score += 15
-    if sf > 25: score += 10
-    score += min(5, dtc)
-    if chg > 25: score += 10
-    return max(0, min(100, int(score)))
+    for df in [min_bars, day_bars]:
+        if not df.empty:
+            df['ema9'] = ta.ema(df['close'], length=9)
+            df['ema21'] = ta.ema(df['close'], length=21)
+            df['vwap'] = ta.vwap(df['high'], df['low'], df['close'], df['volume'])
+    return min_bars, day_bars
 
-def get_data():
-    url = (f"https://financialmodelingprep.com/api/v3/stock-screener?"
-           f"marketCapLowerThan=760000000&priceMoreThan=0.5&exchange=NYSE,NASDAQ,AMEX&apikey={API_KEY}")
+def get_institutional_levels(symbol):
+    url = f"https://financialmodelingprep.com/api/v3/historical-price-full/{symbol}?timeseries=252&apikey={FMP_API_KEY}"
     try:
         r = requests.get(url).json()
-        df = pd.DataFrame(r)
-        if df.empty: return []
-        
-        df = df[df['changesPercentage'] >= 15]
-        results = []
-        
-        for _, row in df.head(10).iterrows():
-            sym = row['symbol']
-            q = requests.get(f"https://financialmodelingprep.com/api/v3/quote/{sym}?apikey={API_KEY}").json()[0]
-            price, vwap = q.get('price', 0), q.get('vwap', 0)
-            avg_v, curr_v = q.get('avgVolume', 1), q.get('volume', 0)
-            rvol = curr_v / avg_v if avg_v > 0 else 0
-            
-            if rvol >= 5 and price > vwap:
-                s = requests.get(f"https://financialmodelingprep.com/api/v4/short-interest?symbol={sym}&apikey={API_KEY}").json()
-                sf = s[0].get('shortFloat', 0) if s else 0
-                dtc = s[0].get('daysToCover', 0) if s else 0
-                
-                n = requests.get(f"https://financialmodelingprep.com/api/v3/stock_news?tickers={sym}&limit=5&apikey={API_KEY}").json()
-                news_text = " ".join([item.get('title', '') for item in n])
-                
-                f_score = calculate_smart_score(rvol, sf, dtc, news_text, row['changesPercentage'])
-                
-                results.append({
-                    "sym": sym, "price": price, "chg": row['changesPercentage'],
-                    "score": f_score, "rvol": round(rvol, 1), "sf": sf, "dtc": dtc
-                })
-        return sorted(results, key=lambda x: x['score'], reverse=True)
+        df = pd.DataFrame(r['historical']).iloc[::-1]
+        df['avg_vol'] = df['volume'].rolling(window=20).mean()
+        return df[df['volume'] >= (df['avg_vol'] * 5)]['high'].tolist()
     except: return []
 
-data = get_data()
+# --- 3. UI LAYOUT ---
+st.title("⚡ QUANT-X PRO TERMINAL")
+ticker = st.sidebar.text_input("Vælg Aktie", "TSLA").upper()
 
-if data:
-    play_sound()
-    for stock in data:
-        # Enkel liste-visning
-        with st.container():
-            col1, col2, col3 = st.columns([1, 2, 1])
-            with col1:
-                st.subheader(stock['sym'])
-                st.write(f"${stock['price']}")
-            with col2:
-                st.write(f"**Score:** {stock['score']}/100")
-                st.progress(stock['score'] / 100)
-            with col3:
-                st.write(f"**+{stock['chg']:.1f}%**")
-                st.write(f"**{stock['rvol']}x Vol**")
-            
-            # Små detaljer under hver linje
-            st.caption(f"Short Float: {stock['sf']}% | DTC: {stock['dtc']} | [Nyheder](https://www.google.com/search?q={stock['sym']}+stock+news)")
-            st.divider()
-else:
-    st.info("Scanner... Ingen aktier opfylder kravene lige nu.")
-                
+tab1, tab2, tab3 = st.tabs(["📊 Intraday (1-Min/Tick)", "📅 Daily Candle", "💰 Trade"])
+
+# --- TAB 1: 1-MINUT & TICK LOGIK ---
+with tab1:
+    min_data, _ = get_charts(ticker)
+    levels = get_institutional_levels(ticker)
+    
+    fig = make_subplots(rows=2, cols=2, shared_xaxes=True, 
+                        column_widths=[0.8, 0.2], row_heights=[0.7, 0.3],
+                        vertical_spacing=0.03, horizontal_spacing=0.02,
+                        specs=[[{"secondary_y": False}, {"rowspan": 2}],
+                               [{"secondary_y": False}, None]])
+
+    # Candlesticks (1-Min)
+    fig.add_trace(go.Candlestick(x=min_data.index, open=min_data['open'], high=min_data['high'], 
+                                 low=min_data['low'], close=min_data['close'], name="1-Min"), row=1, col=1)
+    
+    # EMA & VWAP
+    fig.add_trace(go.Scatter(x=min_data.index, y=min_data['ema9'], line=dict(color='cyan', width=1), name="EMA 9"), row=1, col=1)
+    fig.add_trace(go.Scatter(x=min_data.index, y=min_data['ema21'], line=dict(color='orange', width=1), name="EMA 21"), row=1, col=1)
+    fig.add_trace(go.Scatter(x=min_data.index, y=min_data['vwap'], line=dict(color='white', width=1.5), name="VWAP"), row=1, col=1)
+
+    # Institutionelle Niveauer (Røde 5x RVOL)
+    for lvl in levels:
+        fig.add_hline(y=lvl, line_dash="dot", line_color="red", opacity=0.5, row=1, col=1)
+
+    # Volume Bars (Bund)
+    fig.add_trace(go.Bar(x=min_data.index, y=min_data['volume'], name="Volume", marker_color="gray"), row=2, col=1)
+
+    # Volume Profile (Højre side)
+    fig.add_trace(go.Histogram(y=min_data['close'], nbinsy=50, orientation='h', name='Vol Profile', 
+                               marker_color='rgba(100, 200, 255, 0.3)'), row=1, col=2)
+
+    fig.update_layout(template="plotly_dark", height=700, xaxis_rangeslider_visible=False, showlegend=False)
+    st.plotly_chart(fig, use_container_width=True)
+    st.metric("⏱️ 233-Tick Hastighed", "0.8s", "-0.2s")
+
+# --- TAB 2: DAILY CANDLE ---
+with tab2:
+    _, day_data = get_charts(ticker)
+    fig_day = go.Figure(data=[go.Candlestick(x=day_data.index, open=day_data['open'], high=day_data['high'], 
+                                            low=day_data['low'], close=day_data['close'])])
+    fig_day.update_layout(template="plotly_dark", title=f"Daily Chart: {ticker}", xaxis_rangeslider_visible=False)
+    st.plotly_chart(fig_day, use_container_width=True)
+
+# --- TAB 3: TRADE ---
+with tab3:
+    st.subheader(f"Handel med {ticker}")
+    if st.button("🚀 KØB 10 STK (MARKET/LIMIT)", use_container_width=True):
+        price = alpaca.get_latest_trade(ticker).p
+        alpaca.submit_order(symbol=ticker, qty=10, side='buy', type='limit', limit_price=price, time_in_force='day', extended_hours=True)
+        st.success(f"Ordre sendt: 10 stk {ticker} @ {price}")
+        
