@@ -4,89 +4,86 @@ import requests
 import time
 from streamlit_autorefresh import st_autorefresh
 
-st.set_page_config(page_title="Squeeze Scanner", page_icon="🔥", layout="centered")
+# Mobil-optimeret layout
+st.set_page_config(page_title="Squeeze Super-App", page_icon="⚡", layout="centered")
 
 # Auto-refresh hvert 30. sekund
 st_autorefresh(interval=30 * 1000, key="datarefresh")
 
-st.title("🔥 Short Squeeze Radar")
-st.caption(f"Scanner efter RVOL > 5x og +15% stigning | Opdateret kl. {time.strftime('%H:%M:%S')}")
+# Skjul Streamlit standard menu for "App-følelse"
+hide_style = """
+    <style>
+    #MainMenu {visibility: hidden;}
+    footer {visibility: hidden;}
+    header {visibility: hidden;}
+    div.block-container {padding-top: 2rem;}
+    </style>
+    """
+st.markdown(hide_style, unsafe_allow_html=True)
+
+st.title("⚡ Squeeze Terminal")
+st.caption(f"Status: Live • {time.strftime('%H:%M:%S')}")
 
 API_KEY = "DKC7vblNaiBbTzht7ASgqgnmlvzl5ym"
 
-def fetch_squeeze_data():
-    # 1. Hent potentielle runners via screener
+def get_data():
     url = (f"https://financialmodelingprep.com/api/v3/stock-screener?"
            f"marketCapLowerThan=760000000&priceMoreThan=0.5&"
            f"isEtf=false&exchange=NYSE,NASDAQ,AMEX&apikey={API_KEY}")
-    
     try:
-        r = requests.get(url)
-        df = pd.DataFrame(r.json())
-        if df.empty: return pd.DataFrame()
-
-        # Filtrer først på prisstigning for at spare kræfter
+        r = requests.get(url).json()
+        df = pd.DataFrame(r)
+        if df.empty: return []
+        
+        # Filter: Kun dem med fart på (+15%)
         df = df[df['changesPercentage'] >= 15]
         
-        final_list = []
-        for _, row in df.iterrows():
-            symbol = row['symbol']
+        results = []
+        for _, row in df.head(10).iterrows(): # Max 10 for hastighed
+            sym = row['symbol']
             
-            # 2. Hent Short Interest og gennemsnitsvolumen (RVOL)
-            # Vi bruger quote-endpunktet for at få præcis gennemsnitsvolumen
-            q_url = f"https://financialmodelingprep.com/api/v3/quote/{symbol}?apikey={API_KEY}"
-            v_data = requests.get(q_url).json()[0]
+            # Hent Quote (RVOL)
+            q = requests.get(f"https://financialmodelingprep.com/api/v3/quote/{sym}?apikey={API_KEY}").json()[0]
+            avg_v = q.get('avgVolume', 1)
+            curr_v = q.get('volume', 0)
+            rvol = curr_v / avg_v if avg_v > 0 else 0
             
-            avg_vol = v_data.get('avgVolume', 1)
-            current_vol = v_data.get('volume', 0)
-            rvol = current_vol / avg_vol if avg_vol > 0 else 0
+            # Filter: Kun høj volumen (RVOL > 5)
+            if rvol < 5: continue
             
-            # 3. Hent Short Float data
-            s_url = f"https://financialmodelingprep.com/api/v4/short-interest?symbol={symbol}&apikey={API_KEY}"
-            s_data = requests.get(s_url).json()
+            # Hent Short Data
+            s = requests.get(f"https://financialmodelingprep.com/api/v4/short-interest?symbol={sym}&apikey={API_KEY}").json()
+            sf = s[0].get('shortFloat', 0) if s else 0
+            dtc = s[0].get('daysToCover', 0) if s else 0
             
-            short_float = s_data[0].get('shortFloat', 0) if s_data else 0
-            days_to_cover = s_data[0].get('daysToCover', 0) if s_data else 0
+            # Simpel AI Sentiment Logik (Kombinerer stigning og RVOL)
+            sentiment = "🟢 POSITIV" if rvol > 10 and row['changesPercentage'] > 20 else "🟡 NEUTRAL"
             
-            # FILTER: RVOL skal være over 5
-            if rvol >= 5:
-                final_list.append({
-                    'Symbol': symbol,
-                    'Pris': row['price'],
-                    'Stigning %': row['changesPercentage'],
-                    'RVOL': round(rvol, 2),
-                    'Short Float %': round(short_float, 2),
-                    'Days to Cover': round(days_to_cover, 2),
-                    'Volumen': current_vol
-                })
-        
-        return pd.DataFrame(final_list)
-    except:
-        return pd.DataFrame()
+            results.append({
+                "sym": sym, "price": row['price'], "chg": row['changesPercentage'],
+                "rvol": round(rvol, 1), "sf": round(sf, 1), "dtc": round(dtc, 1),
+                "sent": sentiment
+            })
+        return results
+    except: return []
 
-results = fetch_squeeze_data()
+data = get_data()
 
-if not results.empty:
-    st.success(f"Fundet {len(results)} potentielle Squeezes!")
-    for _, row in results.iterrows():
-        with st.container():
-            col1, col2, col3 = st.columns([1, 1, 1])
-            with col1:
-                st.subheader(row['Symbol'])
-                st.write(f"Pris: ${row['Pris']}")
-            with col2:
-                st.write(f"**Stigning:** {row['Stigning %']:.1f}%")
-                st.write(f"**RVOL:** {row['RVOL']}x")
-            with col3:
-                st.write(f"**Short:** {row['Short Float %']}%")
-                st.write(f"**DTC:** {row['Days to Cover']}")
+if data:
+    for stock in data:
+        # Kompakt overskrift til mobil
+        with st.expander(f"{stock['sym']} | ${stock['price']} | +{stock['chg']:.1f}%", expanded=False):
+            c1, c2 = st.columns(2)
+            with c1:
+                st.metric("RVOL (Tryk)", f"{stock['rvol']}x")
+                st.write(f"**Short Float:** {stock['sf']}%")
+            with c2:
+                st.write(f"**Sentiment:** {stock['sent']}")
+                st.write(f"**Days to Cover:** {stock['dtc']}")
             
-            # Visuel indikator for ekstremt squeeze potentiale
-            if row['Short Float %'] > 20:
-                st.warning("⚠️ EKSTREMT HØJ SHORT FLOAT")
-                
-            st.markdown(f"[Nyheder](https://www.google.com/search?q={row['Symbol']}+stock+news&tbm=nws)")
-            st.divider()
+            st.markdown(f"[🔍 Hurtig Analyse](https://www.google.com/search?q={stock['sym']}+stock+short+squeeze)")
+            if stock['sf'] > 20:
+                st.error("🔥 HIGH SQUEEZE POTENTIAL")
 else:
-    st.info("Søger... Ingen aktier med RVOL > 5 og +15% stigning lige nu.")
-    
+    st.info("Scanner markedet for 5x volumen og +15% stigning...")
+
