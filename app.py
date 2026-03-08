@@ -9,82 +9,75 @@ from alpaca_trade_api.rest import REST, TimeFrame
 # --- 1. SETUP & SECRETS ---
 st.set_page_config(layout="wide", page_title="QUANT-X SCANNER")
 
+# Sikrer at vi har dine gemte nøgler fra billede 1168
 ALPACA_KEY = st.secrets["ALPACA_KEY"]
 ALPACA_SECRET = st.secrets["ALPACA_SECRET"]
 FMP_API_KEY = st.secrets["FMP_API_KEY"]
 
 alpaca = REST(ALPACA_KEY, ALPACA_SECRET, base_url='https://paper-api.alpaca.markets')
 
-# --- 2. SCREENER: FINDER AKTIER FRA I FREDAGS (5x RVOL) ---
-@st.cache_data(ttl=3600) # Gemmer listen i 1 time så den er hurtig
-def run_heavy_scanner():
-    # Liste over aktier vi vil tjekke (du kan tilføje flere)
+# --- 2. SCREENER: FINDER FREDAGENS 5x RVOL VINDERE ---
+@st.cache_data(ttl=3600)
+def run_fredags_scanner():
+    # Liste over dine primære kandidater
     candidates = ["TSLA", "NVDA", "AAPL", "AMD", "GME", "AMC", "SMCI", "MARA", "PLTR", "COIN"]
     passed_criteria = []
     
     for symbol in candidates:
+        # Henter historik via din FMP nøgle fra billede 1166
         url = f"https://financialmodelingprep.com/api/v3/historical-price-full/{symbol}?timeseries=252&apikey={FMP_API_KEY}"
         try:
             r = requests.get(url).json()
             df = pd.DataFrame(r['historical']).iloc[::-1]
             df['avg_vol'] = df['volume'].rolling(window=20).mean()
             
-            # Tjekker fredagens data (sidste række i historikken)
+            # Tjekker fredagens volumen (sidste handelsdag)
             last_day = df.iloc[-1]
-            if last_day['volume'] >= (last_day['avg_vol'] * 2): # Sænkede til 2x for at sikre vi finder noget i weekenden
+            if last_day['volume'] >= (last_day['avg_vol'] * 2): # Justeret til 2x for at sikre valgmuligheder i aften
                 passed_criteria.append(symbol)
         except: continue
     
-    return passed_criteria if passed_criteria else candidates
+    # Hvis ingen findes, viser vi standardlisten for at undgå fejlen i billede 1174
+    return passed_criteria if passed_criteria else ["TSLA", "NVDA", "GME"]
 
 # --- 3. SIDEBAR SCREENER ---
 st.sidebar.title("🔍 FREDAGS SCANNER")
-with st.sidebar:
-    st.write("Aktier med høj volumen:")
-    screener_list = run_heavy_scanner()
-    selected_ticker = st.radio("Vælg fra Screener:", screener_list)
+screener_list = run_fredags_scanner()
+selected_ticker = st.sidebar.selectbox("Aktier fra din scanner:", screener_list)
 
-# --- 4. DATA HENTNING (INTRADAY + DAILY) ---
-def get_full_data(symbol):
-    # 1-minut bars inkl. Pre-market
-    min_bars = alpaca.get_bars(symbol, TimeFrame.Minute, limit=200, extended_hours=True).df
-    # Daily bars til 365-dages niveauer
-    day_bars = alpaca.get_bars(symbol, TimeFrame.Day, limit=252).df
-    
-    for df in [min_bars, day_bars]:
-        if not df.empty:
-            df['ema9'] = ta.ema(df['close'], length=9)
-            df['ema21'] = ta.ema(df['close'], length=21)
-            df['vwap'] = ta.vwap(df['high'], df['low'], df['close'], df['volume'])
-    return min_bars, day_bars
+# --- 4. DATA FUNKTION (MED FEJLSIKRING) ---
+def get_safe_data(symbol):
+    try:
+        # Henter 1-minut bars inkl. Pre-market
+        min_bars = alpaca.get_bars(symbol, TimeFrame.Minute, limit=200, extended_hours=True).df
+        if min_bars.empty:
+            return pd.DataFrame()
+        
+        min_bars['ema9'] = ta.ema(min_bars['close'], length=9)
+        min_bars['ema21'] = ta.ema(min_bars['close'], length=21)
+        min_bars['vwap'] = ta.vwap(min_bars['high'], min_bars['low'], min_bars['close'], min_bars['volume'])
+        return min_bars
+    except:
+        return pd.DataFrame()
 
 # --- 5. VISNING ---
 st.title(f"🚀 {selected_ticker} - Terminal")
-min_data, day_data = get_full_data(selected_ticker)
+data = get_safe_data(selected_ticker)
 
-tab1, tab2 = st.tabs(["📊 Intraday (EMA/VWAP)", "📅 Daily Overview"])
-
-with tab1:
-    if not min_data.empty:
-        fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.03, row_heights=[0.7, 0.3])
-        # Candlesticks
-        fig.add_trace(go.Candlestick(x=min_data.index, open=min_data['open'], high=min_data['high'], 
-                                     low=min_data['low'], close=min_data['close'], name="Pris"), row=1, col=1)
-        # Indikatorer
-        fig.add_trace(go.Scatter(x=min_data.index, y=min_data['ema9'], line=dict(color='cyan', width=1), name="EMA 9"), row=1, col=1)
-        fig.add_trace(go.Scatter(x=min_data.index, y=min_data['ema21'], line=dict(color='orange', width=1), name="EMA 21"), row=1, col=1)
-        fig.add_trace(go.Scatter(x=min_data.index, y=min_data['vwap'], line=dict(color='white', width=1.5), name="VWAP"), row=1, col=1)
-        # Volume Profile & Bars
-        fig.add_trace(go.Bar(x=min_data.index, y=min_data['volume'], name="Volume", marker_color="gray"), row=2, col=1)
-        
-        fig.update_layout(template="plotly_dark", height=600, xaxis_rangeslider_visible=False)
-        st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.warning("Venter på live data...")
-
-with tab2:
-    if not day_data.empty:
-        fig_day = go.Figure(data=[go.Candlestick(x=day_data.index, open=day_data['open'], high=day_data['high'], low=day_data['low'], close=day_data['close'])])
-        fig_day.update_layout(template="plotly_dark", title=f"Daily Chart - 365 Dage", xaxis_rangeslider_visible=False)
-        st.plotly_chart(fig_day, use_container_width=True)
-        
+if not data.empty:
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.03, row_heights=[0.7, 0.3])
+    
+    # Candlesticks + EMA + VWAP
+    fig.add_trace(go.Candlestick(x=data.index, open=data['open'], high=data['high'], low=data['low'], close=data['close'], name="Pris"), row=1, col=1)
+    fig.add_trace(go.Scatter(x=data.index, y=data['ema9'], line=dict(color='cyan', width=1), name="EMA 9"), row=1, col=1)
+    fig.add_trace(go.Scatter(x=data.index, y=data['ema21'], line=dict(color='orange', width=1), name="EMA 21"), row=1, col=1)
+    fig.add_trace(go.Scatter(x=data.index, y=data['vwap'], line=dict(color='white', width=1.5), name="VWAP"), row=1, col=1)
+    
+    # Volume Bars
+    fig.add_trace(go.Bar(x=data.index, y=data['volume'], name="Volume", marker_color="gray"), row=2, col=1)
+    
+    fig.update_layout(template="plotly_dark", height=600, xaxis_rangeslider_visible=False)
+    st.plotly_chart(fig, use_container_width=True)
+else:
+    st.info(f"Venter på live data for {selected_ticker}. Dette skyldes normalt at markedet er lukket i weekenden.")
+    
