@@ -1,83 +1,42 @@
-import streamlit as st
-import pandas as pd
-import requests
-from streamlit_autorefresh import st_autorefresh # Husk at tilføje denne til requirements.txt
-import streamlit.components.v1 as components
+# --- NYE FUNKTIONER TIL RISIKO-ANALYSE ---
 
-# --- 1. SETUP & AUTO-REFRESH (Hvert 30. sekund) ---
-st.set_page_config(layout="wide", page_title="QUANT-X LIVE TERMINAL")
-
-# Dette får appen til at genindlæse hvert 30.000 millisekund (30 sek)
-count = st_autorefresh(interval=30000, key="fmp_refresh")
-
-FMP_API_KEY = st.secrets["FMP_API_KEY"]
-
-# --- 2. JAVASCRIPT TIL CHROME NOTIFIKATIONER ---
-def send_chrome_notification(title, message):
-    js_code = f"""
-    <script>
-    function notify() {{
-      if (Notification.permission === "granted") {{
-        new Notification("{title}", {{ body: "{message}", icon: "https://cdn-icons-png.flaticon.com/512/2522/2522648.png" }});
-      }} else if (Notification.permission !== "denied") {{
-        Notification.requestPermission().then(permission => {{
-          if (permission === "granted") {{
-            new Notification("{title}", {{ body: "{message}" }});
-          }}
-        }});
-      }}
-    }}
-    notify();
-    </script>
-    """
-    components.html(js_code, height=0)
-
-# --- 3. DATA & SCANNER (Præcis som før) ---
-@st.cache_data(ttl=25) # Cache er kortere end refresh for at få friske data
-def run_live_scanner():
-    url = f"https://financialmodelingprep.com/api/v3/stock_screener?priceLowerThan=30&marketCapLowerThan=760000000&volumeMoreThan=500000&isEtf=false&isActivelyTrading=true&limit=20&apikey={FMP_API_KEY}"
+def check_dilution_risk(symbol):
+    """Scanner fundamentale tal og SEC-filer for offering-risiko"""
     try:
-        stocks = requests.get(url).json()
-        results = []
-        for s in stocks:
-            symbol = s['symbol']
-            # RVOL og andre data her... (forkortet for plads, brug din eksisterende logik)
-            results.append(s)
-        return results
-    except: return []
+        # 1. Tjek kontantbeholdning (Balance Sheet)
+        url_bs = f"https://financialmodelingprep.com/api/v3/balance-sheet-statement/{symbol}?limit=1&apikey={FMP_API_KEY}"
+        bs = requests.get(url_bs).json()
+        
+        # 2. Tjek seneste SEC Filings for Warrants/S-3
+        url_sec = f"https://financialmodelingprep.com/api/v3/sec_filings/{symbol}?limit=5&apikey={FMP_API_KEY}"
+        sec = requests.get(url_sec).json()
+        
+        risk_msg = "✅ LAV"
+        risk_score = 0
+        
+        if bs:
+            cash = bs[0].get('cashAndCashEquivalents', 0)
+            debt = bs[0].get('totalDebt', 0)
+            # Hvis gæld er 3x større end kontanter = Høj risiko
+            if debt > (cash * 3): 
+                risk_msg = "⚠️ HØJ (Cash Low)"
+                risk_score -= 20
 
-# --- 4. NOTIFIKATIONS LOGIK ---
-# Vi gemmer de fundne aktier i 'session_state', så vi kun får besked om NYE aktier
-if 'last_seen_stocks' not in st.session_state:
-    st.session_state.last_seen_stocks = []
+        if sec:
+            for filing in sec:
+                if any(k in filing['type'] for k in ["S-3", "424B", "F-3"]):
+                    risk_msg = "🚨 OFFERING RISK (SEC)"
+                    risk_score -= 30
+                    break
+                    
+        return risk_msg, risk_score
+    except: return "N/A", 0
 
-st.title("🚀 QUANT-X LIVE TERMINAL")
-st.write(f"Sidste opdatering: {pd.Timestamp.now().strftime('%H:%M:%S')} (Næste om 30 sek)")
+# --- INTEGRATION I DIN LISTE ---
+# (I din loop for hver aktie tilføjer vi nu dette:)
 
-data = run_live_scanner()
+risk_label, risk_penalty = check_dilution_risk(symbol)
+total_score += risk_penalty # Trækker point fra hvis de mangler penge
 
-if data:
-    current_symbols = [s['symbol'] for s in data]
-    
-    # Find nye aktier der ikke var på listen sidst
-    new_stocks = [s for s in current_symbols if s not in st.session_state.last_seen_stocks]
-    
-    if new_stocks:
-        # SEND CHROME NOTIFIKATION!
-        msg = f"Nye breakouts fundet: {', '.join(new_stocks)}"
-        send_chrome_notification("🚀 QUANT-X ALERT", msg)
-        st.session_state.last_seen_stocks = current_symbols # Opdater listen over sete aktier
-
-    # VIS TABELLEN
-    st.table(pd.DataFrame(data))
-
-# --- 5. TILLADELSE KNAP ---
-if st.button("🔔 Aktiver Chrome Notifikationer"):
-    components.html("""
-    <script>
-    Notification.requestPermission().then(function(result) {
-      alert("Notifikationer er nu: " + result);
-    });
-    </script>
-    """, height=0)
-    
+# NY KOLONNE I TABELLEN:
+# "RISIKO": risk_label
