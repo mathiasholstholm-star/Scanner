@@ -4,21 +4,21 @@ import requests
 from datetime import datetime
 import pytz
 
-# --- KONFIGURATION ---
+# --- KONFIGURATION AF TERMINAL ---
 st.set_page_config(page_title="Quant-X Master Terminal", layout="wide", page_icon="⚡")
-st.markdown("<h1 style='text-align: center; color: #00ff00;'>QUANT-X MASTER TERMINAL</h1>", unsafe_allow_html=True)
+st.markdown("<h1 style='text-align: center; color: #00ff00; margin-bottom: 0;'>QUANT-X MASTER TERMINAL</h1>", unsafe_allow_html=True)
 
-# ⚠️ HUSK DIN API NØGLE ⚠️
+# ⚠️ INDSÆT DIN API NØGLE HER ⚠️
 API_KEY = "DIN_FMP_API_KEY_HER" 
 
 def is_regular_market_hours():
     est = pytz.timezone('US/Eastern')
     now_est = datetime.now(est)
     if now_est.weekday() >= 5: return False
-    return now_est.replace(hour=9, minute=30) <= now_est <= now_est.replace(hour=16, minute=0)
+    return now_est.replace(hour=9, minute=30, second=0) <= now_est <= now_est.replace(hour=16, minute=0, second=0)
 
 def get_detailed_metrics(ticker):
-    """Henter Float og Institutionelle data"""
+    """Henter Float og Institutionelle data med fejlsikring"""
     try:
         m_url = f"https://financialmodelingprep.com/api/v3/key-metrics-ttm/{ticker}?limit=1&apikey={API_KEY}"
         m_data = requests.get(m_url).json()
@@ -28,7 +28,8 @@ def get_detailed_metrics(ticker):
         i_data = requests.get(i_url).json()
         i_val = i_data[0].get('totalWeight', 0) if isinstance(i_data, list) and len(i_data) > 0 else 0
         return f_val, i_val
-    except: return 0, 0
+    except:
+        return 0, 0
 
 def get_daily_vwap(ticker):
     """Beregner intraday VWAP fra 1-min data"""
@@ -42,46 +43,51 @@ def get_daily_vwap(ticker):
         v = sum(c['volume'] for c in day_c)
         pv = sum(((c['high']+c['low']+c['close'])/3) * c['volume'] for c in day_c)
         return pv / v if v > 0 else None
-    except: return None
+    except:
+        return None
 
-@st.cache_data(ttl=5)
+@st.cache_data(ttl=10)
 def fetch_terminal_data():
-    # METODE: Vi henter samtlige NASDAQ symboler og tjekker dem én efter én
-    # Dette er den ENESTE måde at sikre at AZI ikke bliver overset af et langsomt filter
+    # NY STRATEGI: Vi henter alle aktive symboler og finder dem med høj volumen manuelt
+    # Dette omgår fejlen 'slice(None, 150, None)'
     try:
-        # Vi henter de mest aktive NASDAQ aktier
-        url = f"https://financialmodelingprep.com/api/v3/symbol/NASDAQ?apikey={API_KEY}"
+        # Vi bruger quote-tradeable endpointet som er mere stabilt
+        url = f"https://financialmodelingprep.com/api/v3/stock_market/actives?apikey={API_KEY}"
         resp = requests.get(url).json()
-        if not resp: return pd.DataFrame()
         
-        # Vi tager de 150 mest aktive og henter deres LIVE quotes
-        syms = [s['symbol'] for s in resp[:150]]
-        q_url = f"https://financialmodelingprep.com/api/v3/quote/{','.join(syms)}?apikey={API_KEY}"
-        quotes = requests.get(q_url).json()
-        
+        if not isinstance(resp, list):
+            # Fallback til top-gainers hvis actives fejler
+            url = f"https://financialmodelingprep.com/api/v3/stock_market/gainers?apikey={API_KEY}"
+            resp = requests.get(url).json()
+
+        if not resp or not isinstance(resp, list):
+            return pd.DataFrame()
+            
         reg_h = is_regular_market_hours()
         m_vol = 500000 if reg_h else 50000
         valid = []
 
-        for q in quotes:
+        for q in resp:
             t = q.get('symbol')
             p = q.get('price', 0)
             ch = q.get('changesPercentage', 0)
             v = q.get('volume', 0)
 
-            # DINE STRIKTE KRITERIER (AZI ER $0.59 OG >100% GAIN)
+            # DINE FILTRE: Gain > 15%, Pris < 30, Volumen tjek
             if ch >= 15.0 and p <= 30.0 and v >= m_vol:
                 f_v, i_v = get_detailed_metrics(t)
                 vw_v = get_daily_vwap(t)
                 vw_s = "🟢 OVER" if vw_v and p >= vw_v else "🔴 UNDER"
                 
-                # DIN SCORE LOGIK (Float + Momentum + VWAP)
+                # DIN SCORE LOGIK
                 sc = 65
-                if 0 < f_v < 15000000: sc += 15 # Bonus for low float
+                if 0 < f_v < 15000000: sc += 15 
                 if ch > 30: sc += 10
                 if vw_s == "🟢 OVER": sc += 5
                 
-                if sc >= 75:
+                final_score = min(99, sc)
+
+                if final_score >= 75:
                     valid.append({
                         'TICKER': t,
                         'PRICE': f"${p:.2f}",
@@ -90,29 +96,28 @@ def fetch_terminal_data():
                         'FLOAT': f"{int(f_v/1000000)}M" if f_v > 0 else "N/A",
                         'INST %': f"{i_v:.1f}%",
                         'VOLUME': f"{int(v):,}",
-                        'SCORE': sc
+                        'SCORE': final_score
                     })
         return pd.DataFrame(valid)
     except Exception as e:
-        st.error(f"Fejl: {e}")
+        st.error(f"Fejl i datahentning: {e}")
         return pd.DataFrame()
 
-# --- UI ---
-st.subheader("Quant-X Master Momentum Scanner")
+# --- UI VISNING ---
+st.subheader("Live Momentum Terminal")
 
-if st.button("🔄 FORCE REFRESH"):
+if st.button("🔄 Manuel Opdatering"):
     fetch_terminal_data.clear()
     st.rerun()
 
-with st.spinner("Tvinger live-data frem fra NASDAQ..."):
+with st.spinner("Tjekker markedet for gappers..."):
     df = fetch_terminal_data()
 
 if not df.empty:
     df['n'] = df['GAIN %'].str.replace('+', '').str.replace('%', '').astype(float)
     st.dataframe(df.sort_values('n', ascending=False).drop(columns=['n']), use_container_width=True, hide_index=True)
 else:
-    st.info("Scanner... Hvis AZI ikke er her nu, så tjek din API-nøgle for 'Starter' adgang.")
+    st.info("Ingen aktier fundet i øjeblikket med dine kriterier (15% Gain / 50k Vol).")
 
 st.markdown("---")
-st.caption(f"Status: Aktiv | Tid: {datetime.now().strftime('%H:%M:%S')} | Pre-market Filter: 50k")
-        
+st.caption(f"Scanner Status: OK | Sidste tjek: {datetime.now().strftime('%H:%M:%S')}")
