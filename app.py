@@ -21,7 +21,7 @@ def is_regular_market_hours():
     return market_open <= now_est <= market_close
 
 def get_detailed_metrics(ticker):
-    """Henter Float og Institutionelle data med fejlsikring"""
+    """Henter Float og Institutionelle data"""
     try:
         m_url = f"https://financialmodelingprep.com/api/v3/key-metrics-ttm/{ticker}?limit=1&apikey={API_KEY}"
         m_resp = requests.get(m_url).json()
@@ -51,45 +51,36 @@ def get_daily_vwap(ticker):
 
 @st.cache_data(ttl=10)
 def fetch_terminal_data():
-    # 1. Hent rådata (Ingen Market Cap filter - fanger AZI)
-    url = f"https://financialmodelingprep.com/api/v3/stock-screener?priceLowerThan=30&isActivelyTrading=true&limit=150&apikey={API_KEY}"
+    # NY STRATEGI: Vi bruger 'stock_market/gainers' - det er det hurtigste live-feed i pre-market
+    # Dette endpoint ignorerer alle filtre og viser bare dem, der stiger MEST lige nu.
+    url = f"https://financialmodelingprep.com/api/v3/stock_market/gainers?apikey={API_KEY}"
     
     try:
         response = requests.get(url).json()
-        if not response or not isinstance(response, list): return pd.DataFrame()
+        if not response or not isinstance(response, list): 
+            return pd.DataFrame()
 
-        # --- RETTELSE AF DIN SYNTAX FEJL HER ---
         regular_hours = is_regular_market_hours()
-        if regular_hours:
-            min_vol = 500000
-        else:
-            min_vol = 50000
-            
+        min_vol = 500000 if regular_hours else 50000
         valid_stocks = []
 
-        symbols = [s['symbol'] for s in response]
-        if not symbols: return pd.DataFrame()
-        
-        quote_url = f"https://financialmodelingprep.com/api/v3/quote/{','.join(symbols[:100])}?apikey={API_KEY}"
-        quotes = requests.get(quote_url).json()
-        if not isinstance(quotes, list): return pd.DataFrame()
-
-        for q in quotes:
+        for q in response:
             ticker = q.get('symbol')
             price = q.get('price', 0)
             change_pct = q.get('changesPercentage', 0)
             vol = q.get('volume', 0)
 
-            # --- DINE FILTRE ---
+            # --- DINE STRIKTE FILTRE (AZI ER $0.59 OG >100% GAIN, SÅ DEN SKAL MED HER) ---
             if change_pct >= 15.0 and price <= 30.0 and vol >= min_vol:
                 
+                # Hent de tunge data kun for kandidaterne
                 float_val, inst_val = get_detailed_metrics(ticker)
                 vwap_val = get_daily_vwap(ticker)
                 vwap_status = "🟢 OVER" if vwap_val and price >= vwap_val else "🔴 UNDER"
                 
-                # --- RISK SCORE LOGIK ---
+                # Score-logik
                 score = 65
-                if 0 < float_val < 15000000: score += 15 
+                if 0 < float_val < 20000000: score += 15
                 if change_pct > 40: score += 10
                 if vwap_status == "🟢 OVER": score += 5
                 
@@ -109,17 +100,17 @@ def fetch_terminal_data():
         
         return pd.DataFrame(valid_stocks)
     except Exception as e:
-        st.error(f"Systemfejl: {e}")
+        st.error(f"Fejl: {e}")
         return pd.DataFrame()
 
 # --- UI VISNING ---
-st.subheader("Quant-X Master Momentum Scanner")
+st.subheader("Quant-X Live Momentum (AZI & Gappers)")
 
 if st.button("🔄 Force Refresh"):
     fetch_terminal_data.clear()
     st.rerun()
 
-with st.spinner("Scanner for Float og VWAP..."):
+with st.spinner("Tvinger live-data frem..."):
     df = fetch_terminal_data()
 
 if not df.empty:
@@ -127,7 +118,7 @@ if not df.empty:
     final_df = df.sort_values('n_gain', ascending=False).drop(columns=['n_gain'])
     st.dataframe(final_df, use_container_width=True, hide_index=True)
 else:
-    st.info("Ingen aktier fundet. Vent på volumen i pre-market.")
+    st.warning("Venter på at FMP opdaterer Gainers-listen. AZI burde dukke op hvert øjeblik.")
 
 st.markdown("---")
-st.caption(f"Tid: {datetime.now().strftime('%H:%M:%S')} | Session: {'Regular' if is_regular_market_hours() else 'Extended'}")
+st.caption(f"Pre-market Mode: AKTIV | Min Vol: 50k")
