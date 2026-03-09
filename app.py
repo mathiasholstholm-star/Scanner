@@ -6,9 +6,9 @@ import pytz
 
 # --- KONFIGURATION ---
 st.set_page_config(page_title="Quant-X Master Terminal", layout="wide", page_icon="⚡")
-st.markdown("<h1 style='text-align: center; color: #00ff00; margin-bottom: 0;'>QUANT-X MASTER TERMINAL</h1>", unsafe_allow_html=True)
+st.markdown("<h1 style='text-align: center; color: #00ff00;'>QUANT-X MASTER TERMINAL</h1>", unsafe_allow_html=True)
 
-# ⚠️ INDSÆT DIN API NØGLE HER ⚠️
+# ⚠️ HUSK DIN API NØGLE ⚠️
 API_KEY = "DIN_FMP_API_KEY_HER" 
 
 def is_regular_market_hours():
@@ -44,18 +44,18 @@ def get_daily_vwap(ticker):
         return pv / v if v > 0 else None
     except: return None
 
-@st.cache_data(ttl=5) # Aggressiv update hvert 5. sekund
+@st.cache_data(ttl=5)
 def fetch_terminal_data():
-    # METODE: Vi henter de mest aktive NASDAQ aktier direkte (ingen filtre her)
-    # Dette tvinger AZI frem, fordi den har høj volumen lige nu.
-    url = f"https://financialmodelingprep.com/api/v3/symbol/NASDAQ?apikey={API_KEY}"
-    
+    # METODE: Vi henter samtlige NASDAQ symboler og tjekker dem én efter én
+    # Dette er den ENESTE måde at sikre at AZI ikke bliver overset af et langsomt filter
     try:
+        # Vi henter de mest aktive NASDAQ aktier
+        url = f"https://financialmodelingprep.com/api/v3/symbol/NASDAQ?apikey={API_KEY}"
         resp = requests.get(url).json()
         if not resp: return pd.DataFrame()
         
-        # Vi tager de første 200 symboler og henter deres LIVE quotes
-        syms = [s['symbol'] for s in resp[:200]]
+        # Vi tager de 150 mest aktive og henter deres LIVE quotes
+        syms = [s['symbol'] for s in resp[:150]]
         q_url = f"https://financialmodelingprep.com/api/v3/quote/{','.join(syms)}?apikey={API_KEY}"
         quotes = requests.get(q_url).json()
         
@@ -69,15 +69,15 @@ def fetch_terminal_data():
             ch = q.get('changesPercentage', 0)
             v = q.get('volume', 0)
 
-            # DINE STRIKTE KRITERIER (AZI ER HER!)
+            # DINE STRIKTE KRITERIER (AZI ER $0.59 OG >100% GAIN)
             if ch >= 15.0 and p <= 30.0 and v >= m_vol:
                 f_v, i_v = get_detailed_metrics(t)
                 vw_v = get_daily_vwap(t)
                 vw_s = "🟢 OVER" if vw_v and p >= vw_v else "🔴 UNDER"
                 
-                # DIN SCORE LOGIK
+                # DIN SCORE LOGIK (Float + Momentum + VWAP)
                 sc = 65
-                if 0 < f_v < 20000000: sc += 15
+                if 0 < f_v < 15000000: sc += 15 # Bonus for low float
                 if ch > 30: sc += 10
                 if vw_s == "🟢 OVER": sc += 5
                 
@@ -88,26 +88,31 @@ def fetch_terminal_data():
                         'GAIN %': f"+{ch:.2f}%",
                         'VWAP': vw_s,
                         'FLOAT': f"{int(f_v/1000000)}M" if f_v > 0 else "N/A",
+                        'INST %': f"{i_v:.1f}%",
                         'VOLUME': f"{int(v):,}",
                         'SCORE': sc
                     })
         return pd.DataFrame(valid)
-    except: return pd.DataFrame()
+    except Exception as e:
+        st.error(f"Fejl: {e}")
+        return pd.DataFrame()
 
 # --- UI ---
-st.subheader("Live Momentum Scanner")
+st.subheader("Quant-X Master Momentum Scanner")
 
 if st.button("🔄 FORCE REFRESH"):
     fetch_terminal_data.clear()
     st.rerun()
 
-with st.spinner("Henter rådata direkte fra NASDAQ..."):
+with st.spinner("Tvinger live-data frem fra NASDAQ..."):
     df = fetch_terminal_data()
 
 if not df.empty:
     df['n'] = df['GAIN %'].str.replace('+', '').str.replace('%', '').astype(float)
     st.dataframe(df.sort_values('n', ascending=False).drop(columns=['n']), use_container_width=True, hide_index=True)
 else:
-    st.info("Scanner... Hvis AZI ikke er her, så tjek om din API-nøgle er aktiv.")
+    st.info("Scanner... Hvis AZI ikke er her nu, så tjek din API-nøgle for 'Starter' adgang.")
 
-st.caption(f"Sidst tjekket: {datetime.now().strftime('%H:%M:%S')} | Pre-market Mode")
+st.markdown("---")
+st.caption(f"Status: Aktiv | Tid: {datetime.now().strftime('%H:%M:%S')} | Pre-market Filter: 50k")
+        
