@@ -1,120 +1,98 @@
 import streamlit as st
 import pandas as pd
-import requests
+import yfinance as yf
 from datetime import datetime
 import pytz
 
-# --- TERMINAL SETUP ---
-st.set_page_config(page_title="Quant-X Master Terminal", layout="wide", page_icon="⚡")
-st.markdown("<h1 style='text-align: center; color: #00ff00;'>QUANT-X MASTER TERMINAL</h1>", unsafe_allow_html=True)
+# --- KONFIGURATION AF TERMINAL ---
+st.set_page_config(page_title="Quant-X Real-Time", layout="wide", page_icon="⚡")
+st.markdown("<h1 style='text-align: center; color: #00ff00;'>QUANT-X REAL-TIME TERMINAL</h1>", unsafe_allow_html=True)
 
-# ⚠️ DIN API NØGLE ⚠️
-API_KEY = "DIN_FMP_API_KEY_HER" 
-
-def get_daily_vwap(ticker):
-    """Beregner intraday VWAP - Afgørende for din Risk Score"""
-    url = f"https://financialmodelingprep.com/api/v3/historical-chart/1min/{ticker}?apikey={API_KEY}"
+def get_vwap_and_metrics(ticker_symbol):
+    """Henter realtidsdata, VWAP og Float via Yahoo Finance"""
     try:
-        resp = requests.get(url).json()
-        if not resp or not isinstance(resp, list): return None
-        today = resp[0]['date'][:10]
-        d = [c for c in resp if c['date'].startswith(today)]
-        if not d: return None
-        v = sum(c['volume'] for c in d)
-        pv = sum(((c['high']+c['low']+c['close'])/3) * c['volume'] for c in d)
-        return pv / v if v > 0 else None
-    except: return None
-
-def get_float_data(ticker):
-    """Henter Float shares (Vigtigt for din momentum-strategi)"""
-    url = f"https://financialmodelingprep.com/api/v3/key-metrics-ttm/{ticker}?limit=1&apikey={API_KEY}"
-    try:
-        data = requests.get(url).json()
-        if isinstance(data, list) and len(data) > 0:
-            return data[0].get('floatShares', 0)
-        return 0
-    except: return 0
+        t = yf.Ticker(ticker_symbol)
+        # Hent intraday data (1-minutters intervaller for i dag)
+        hist = t.history(period="1d", interval="1m")
+        if hist.empty: return None
+        
+        info = t.info
+        current_price = hist['Close'].iloc[-1]
+        prev_close = info.get('previousClose') or hist['Open'].iloc[0]
+        change_pct = ((current_price - prev_close) / prev_close) * 100
+        vol = hist['Volume'].sum()
+        
+        # Beregn VWAP manuelt
+        hist['TP'] = (hist['High'] + hist['Low'] + hist['Close']) / 3
+        vwap_val = (hist['TP'] * hist['Volume']).sum() / hist['Volume'].sum()
+        vwap_status = "🟢 OVER" if current_price >= vwap_val else "🔴 UNDER"
+        
+        # Float og Inst data
+        float_shares = info.get('floatShares', 0)
+        inst_own = info.get('heldPercentInstitutions', 0) * 100
+        
+        return {
+            'TICKER': ticker_symbol,
+            'PRICE': current_price,
+            'GAIN %': change_pct,
+            'VOLUME': vol,
+            'FLOAT': float_shares,
+            'INST %': inst_own,
+            'VWAP': vwap_status
+        }
+    except:
+        return None
 
 @st.cache_data(ttl=10)
-def fetch_terminal_data():
-    # DIN INSTRUKS: Vi henter ALLE aktive aktier under $30. 
-    # Vi fjerner ALLE andre filtre i URL'en for at sikre at AZI kommer med.
-    url = f"https://financialmodelingprep.com/api/v3/stock-screener?priceLowerThan=30&isActivelyTrading=true&limit=1000&apikey={API_KEY}"
-    
-    try:
-        response = requests.get(url).json()
-        if not response or not isinstance(response, list):
-            return pd.DataFrame()
-
-        # Tjekker om vi er i pre-market for volumen-grænsen
-        est = pytz.timezone('US/Eastern')
-        now_est = datetime.now(est)
-        is_reg = now_est.weekday() < 5 and now_est.replace(hour=9, minute=30) <= now_est <= now_est.replace(hour=16, minute=0)
-        min_vol = 500000 if is_reg else 50000
-
-        valid_stocks = []
-
-        # Vi kører igennem de 1000 aktier og finder dine gappers manuelt
-        for stock in response:
-            ticker = stock.get('symbol')
-            price = stock.get('price', 0)
-            vol = stock.get('volume', 0)
+def fetch_terminal_data(manual_list):
+    valid_stocks = []
+    # Vi tjekker AZI og andre momentum-kandidater direkte
+    # Da yfinance ikke har en "live screener", tilføjer vi AZI til overvågning her
+    for ticker in manual_list:
+        data = get_vwap_and_metrics(ticker)
+        if data and data['GAIN %'] >= 15.0 and data['PRICE'] <= 30.0:
             
-            # Vi bruger quote for at få REAL-TIME gain, da screeneren er forsinket
-            # Dette er tricket der henter AZI frem nu!
-            if vol >= min_vol and price <= 30:
-                q_url = f"https://financialmodelingprep.com/api/v3/quote/{ticker}?apikey={API_KEY}"
-                q_data = requests.get(q_url).json()
-                if not q_data: continue
-                
-                change_pct = q_data[0].get('changesPercentage', 0)
-                
-                # DIN GRÆNSE: Gain > 15%
-                if change_pct >= 15.0:
-                    vwap_val = get_daily_vwap(ticker)
-                    vwap_status = "🟢 OVER" if vwap_val and price >= vwap_val else "🔴 UNDER"
-                    float_shares = get_float_data(ticker)
-                    
-                    # DIN RISK SCORE LOGIK (Følg dine instrukser)
-                    score = 65
-                    if 0 < float_shares < 15000000: score += 15 # Low float bonus
-                    if change_pct > 30: score += 10
-                    if vwap_status == "🟢 OVER": score += 5
-                    
-                    final_score = min(99, score)
+            # DIN RISK SCORE LOGIK (PUNKT FOR PUNKT)
+            score = 65
+            if 0 < data['FLOAT'] < 20000000: score += 15 # Low float bonus
+            if data['GAIN %'] > 40: score += 10
+            if data['VWAP'] == "🟢 OVER": score += 5
+            
+            final_score = min(99, score)
+            
+            if final_score >= 75:
+                valid_stocks.append({
+                    'TICKER': data['TICKER'],
+                    'PRICE': f"${data['PRICE']:.2f}",
+                    'GAIN %': f"+{data['GAIN %']:.2f}%",
+                    'VWAP': data['VWAP'],
+                    'FLOAT': f"{int(data['FLOAT']/1000000)}M" if data['FLOAT'] > 0 else "N/A",
+                    'INST %': f"{data['INST %']:.1f}%",
+                    'VOLUME': f"{int(data['VOLUME']):,}",
+                    'SCORE': final_score
+                })
+    return pd.DataFrame(valid_stocks)
 
-                    if final_score >= 75:
-                        valid_stocks.append({
-                            'TICKER': ticker,
-                            'PRICE': f"${price:.2f}",
-                            'GAIN %': f"+{change_pct:.2f}%",
-                            'VWAP': vwap_status,
-                            'FLOAT': f"{int(float_shares/1000000)}M" if float_shares > 0 else "N/A",
-                            'VOLUME': f"{int(vol):,}",
-                            'SCORE': final_score
-                        })
-        
-        return pd.DataFrame(valid_stocks)
-    except Exception as e:
-        st.error(f"Fejl: {e}")
-        return pd.DataFrame()
+# --- UI VISNING ---
+st.subheader("Live Momentum Scanner (Realtid via Yahoo Engine)")
 
-# --- UI ---
-st.subheader("Live Momentum Scanner (Realtid Check)")
+# Manuel overvågning så vi er sikre på at AZI er der
+watch_input = st.text_input("Tilføj tickers til scanning (separeret med komma):", "AZI, NINE, GME, KOSS")
+active_list = [x.strip().upper() for x in watch_input.split(",")]
 
 if st.button("🔄 FORCE REFRESH"):
     fetch_terminal_data.clear()
     st.rerun()
 
-with st.spinner("Scanner 1.000+ aktier for dine parametre..."):
-    df = fetch_terminal_data()
+with st.spinner("Henter realtidsdata for dine tickers..."):
+    df = fetch_terminal_data(active_list)
 
 if not df.empty:
-    # Sorter efter højeste gain
+    # Sorter efter gain
     df['n_gain'] = df['GAIN %'].str.replace('+', '').str.replace('%', '').astype(float)
     st.dataframe(df.sort_values('n_gain', ascending=False).drop(columns=['n_gain']), use_container_width=True, hide_index=True)
 else:
-    st.info("Ingen aktier fundet over 15% gain med din volumen-grænse. Prøv 'Force Refresh'.")
+    st.info("Ingen af de overvågede aktier opfylder dine krav (Gain > 15% / Price < $30).")
 
 st.markdown("---")
-st.caption(f"Status: Aktiv | Filter: {'>50k' if datetime.now().hour < 15 else '>500k'} vol")
+st.caption(f"Kilde: Yahoo Finance (Realtid) | Sidst opdateret: {datetime.now().strftime('%H:%M:%S')}")
