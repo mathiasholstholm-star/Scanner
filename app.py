@@ -23,13 +23,10 @@ def is_regular_market_hours():
 def get_detailed_metrics(ticker):
     """Henter Float og Institutionelle data med fejlsikring"""
     try:
-        # 1. Float data
         m_url = f"https://financialmodelingprep.com/api/v3/key-metrics-ttm/{ticker}?limit=1&apikey={API_KEY}"
         m_resp = requests.get(m_url).json()
-        # Tjekker om m_resp er en liste og har indhold (fikser din 'string indices' fejl)
         float_val = m_resp[0].get('floatShares', 0) if isinstance(m_resp, list) and len(m_resp) > 0 else 0
         
-        # 2. Institutional Ownership
         i_url = f"https://financialmodelingprep.com/api/v3/institutional-ownership/symbol-ownership-percent/{ticker}?apikey={API_KEY}"
         i_resp = requests.get(i_url).json()
         inst_own = i_resp[0].get('totalWeight', 0) if isinstance(i_resp, list) and len(i_resp) > 0 else 0
@@ -54,14 +51,83 @@ def get_daily_vwap(ticker):
 
 @st.cache_data(ttl=10)
 def fetch_terminal_data():
-    # 1. Hent rådata (Fjernet Market Cap filter for at få AZI med)
+    # 1. Hent rådata (Ingen Market Cap filter - fanger AZI)
     url = f"https://financialmodelingprep.com/api/v3/stock-screener?priceLowerThan=30&isActivelyTrading=true&limit=150&apikey={API_KEY}"
     
     try:
         response = requests.get(url).json()
         if not response or not isinstance(response, list): return pd.DataFrame()
 
+        # --- RETTELSE AF DIN SYNTAX FEJL HER ---
         regular_hours = is_regular_market_hours()
-        # Dine volumenkrav: 50k pre / 500k regular
-        min_vol = 500000 if
+        if regular_hours:
+            min_vol = 500000
+        else:
+            min_vol = 50000
+            
+        valid_stocks = []
+
+        symbols = [s['symbol'] for s in response]
+        if not symbols: return pd.DataFrame()
         
+        quote_url = f"https://financialmodelingprep.com/api/v3/quote/{','.join(symbols[:100])}?apikey={API_KEY}"
+        quotes = requests.get(quote_url).json()
+        if not isinstance(quotes, list): return pd.DataFrame()
+
+        for q in quotes:
+            ticker = q.get('symbol')
+            price = q.get('price', 0)
+            change_pct = q.get('changesPercentage', 0)
+            vol = q.get('volume', 0)
+
+            # --- DINE FILTRE ---
+            if change_pct >= 15.0 and price <= 30.0 and vol >= min_vol:
+                
+                float_val, inst_val = get_detailed_metrics(ticker)
+                vwap_val = get_daily_vwap(ticker)
+                vwap_status = "🟢 OVER" if vwap_val and price >= vwap_val else "🔴 UNDER"
+                
+                # --- RISK SCORE LOGIK ---
+                score = 65
+                if 0 < float_val < 15000000: score += 15 
+                if change_pct > 40: score += 10
+                if vwap_status == "🟢 OVER": score += 5
+                
+                final_score = min(99, score)
+
+                if final_score >= 75:
+                    valid_stocks.append({
+                        'TICKER': ticker,
+                        'PRICE': f"${price:.2f}",
+                        'GAIN %': f"+{change_pct:.2f}%",
+                        'VWAP': vwap_status,
+                        'FLOAT': f"{int(float_val/1000000)}M" if float_val > 0 else "N/A",
+                        'INST %': f"{inst_val:.1f}%",
+                        'VOLUME': f"{int(vol):,}",
+                        'SCORE': final_score
+                    })
+        
+        return pd.DataFrame(valid_stocks)
+    except Exception as e:
+        st.error(f"Systemfejl: {e}")
+        return pd.DataFrame()
+
+# --- UI VISNING ---
+st.subheader("Quant-X Master Momentum Scanner")
+
+if st.button("🔄 Force Refresh"):
+    fetch_terminal_data.clear()
+    st.rerun()
+
+with st.spinner("Scanner for Float og VWAP..."):
+    df = fetch_terminal_data()
+
+if not df.empty:
+    df['n_gain'] = df['GAIN %'].str.replace('+', '').str.replace('%', '').astype(float)
+    final_df = df.sort_values('n_gain', ascending=False).drop(columns=['n_gain'])
+    st.dataframe(final_df, use_container_width=True, hide_index=True)
+else:
+    st.info("Ingen aktier fundet. Vent på volumen i pre-market.")
+
+st.markdown("---")
+st.caption(f"Tid: {datetime.now().strftime('%H:%M:%S')} | Session: {'Regular' if is_regular_market_hours() else 'Extended'}")
